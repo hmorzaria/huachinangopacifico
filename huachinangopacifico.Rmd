@@ -13,18 +13,67 @@ Vulnerabilidad de areas cercanas a oficinas de pesca
 source("libraries.R")
 source("huachinango_functions.R")
 
-beneficios.data <- lapply(num.beneficios, clean_files, beneficios.csv, tipo.beneficio, names.sp)
 
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
 
 ```{r cars}
-summary(cars)
+
+
+beneficios.csv <- list.files(here("inputs"),pattern = "padron")
+
+num.beneficios <- 1:length(beneficios.csv)
+
+tipo.beneficio <- c("cadenas productivas", "combustible", "comercializacion productos pesqueros", "consumo productos pesqueros","fortalecimiento de capacidades.csv", "inspeccion y vigilancia", "modernizacion de embarcaciones", "obras y estudios", "ordenamiento pesquero","Bienpesca","reduccion del esfuerzo pesquero",         
+"Bienpesca")
+
+names.sp <-c("guachinango","guachinangos","huachinangos","huachinango")
+  
+beneficios.data <- lapply(num.beneficios, clean_files, beneficios.csv, tipo.beneficio)
+
+
+beneficios.base <- beneficios.data %>% 
+  compact %>% 
+  bind_rows %>% 
+  mutate(cve_inegi = if_else(nchar(cve_inegi)==8, paste0("0",cve_inegi), cve_inegi)) %>% 
+  filter(monto_federal_aportado > 0)
+
+beneficios.pesq <- beneficios.base %>% 
+  filter(!is.na(pesqueria)) %>% 
+  filter(pesqueria %in% names.sp) %>% 
+  mutate(pesqueria = "huachinango")
+    
+
+
+rnpa.pesq <- beneficios.pesq %>% 
+  filter(!is.na(rnpa)) %>% 
+  distinct(rnpa) %>% 
+  pull(rnpa)
+
+locs.pesq <- beneficios.pesq %>% 
+  filter(!is.na(cve_inegi)) %>% 
+  distinct(cve_inegi) %>% 
+  pull(cve_inegi)
+
+#en base al rnpa, quienes recibieron subsidios que no estaban marcados pesqueria de huachinango
+beneficios.rnpa <- beneficios.base %>%
+   filter(!pesqueria %in% names.sp) %>%
+  filter(rnpa %in% rnpa.pesq)
+
+beneficios.rnpa.otr <- beneficios.rnpa %>% 
+  distinct(beneficio, rnpa)
+
+beneficios.rnpa.otr %>% distinct(beneficio)
+beneficios.rnpa.otr %>% distinct(rnpa)
+
+
+#beneficios recibidos
+beneficios.pesq %>% distinct(beneficio)
+
+beneficios.pesq <- beneficios.base %>% 
+  filter(!is.na(pesqueria))
+
+  
 ```
 
 ## Including Plots
