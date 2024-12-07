@@ -17,6 +17,327 @@ source("huachinango_functions.R")
 ```
 
 
+Fisheries subsidies
+
+```{r fisheries subsidies, echo=TRUE, message=TRUE, warning=FALSE}
+
+inegi.table <- "inegi_coast_comm.csv"
+inegi.cost.comm <- fix_inegi(inegi.table)
+
+cost.codes.ent <- inegi.cost.comm %>%
+  distinct(CVE_ENT, NOM_ENT) 
+
+cost.codes.mun <- inegi.cost.comm %>%
+  distinct(CVE_ENT, NOM_MUN, CVE_MUN) 
+
+cost.codes.loc <- inegi.cost.comm %>%
+   distinct(NOM_ENT, CVE_ENT, NOM_MUN, CVE_MUN, NOM_LOC, CVE_LOC) 
+ 
+#googlesheet to keep track of names that need correction
+googlesheets4::gs4_deauth()
+locs.pesca <- googlesheets4::read_sheet("1eJXjwlHqEzSAZaTmE_XyN93fu6EI0I8igRH4AdvXOl8")
+
+correct.ent <- locs.pesca %>% 
+  select(-NOM_LOC_REV)
+
+correct.loc <- locs.pesca %>% 
+  select(-NOM_ENT_REV) %>% 
+  keep_when(!is.na(NOM_LOC_REV))
+
+#gas subsidies
+gas.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/padron_beneficiarios_combustible_2011-2019.xlsx")) %>% 
+   keep_when(año>=2014) %>% 
+  mutate(localidad=gsub("-"," ",localidad)) %>% 
+  mutate(NOM_MUN = stringi::stri_trans_general(str = municipio, id = "Latin-ASCII")) %>% 
+  mutate(NOM_MUN = stringi::stri_trans_general(str = municipio, id = "Latin-ASCII")) %>% 
+  mutate(NOM_LOC = stringi::stri_trans_general(str = localidad, id = "Latin-ASCII")) %>% 
+  keep_when(tipo_cobertura=="LOCALIDAD") %>% 
+  extract_comms(inegi.cost.comm) %>% 
+  mutate(NOM_LOC = dplyr::if_else(grepl("BAHIA TORTUGAS", unidadeconmica), "BAHIA TORTUGAS", 
+                                         dplyr::if_else(grepl("SCPP EMANCIPACION SC DE RL", unidadeconmica), "BAHIA TORTUGAS", NOM_LOC)))
+
+gas.subsidy.comms <-  gas.subsidy %>% 
+  dplyr::left_join(correct.ent, by =c("NOM_LOC","NOM_ENT")) %>% 
+  mutate(NOM_ENT = dplyr::if_else(!is.na(NOM_ENT_REV), NOM_ENT_REV, NOM_ENT)) %>%
+  dplyr::rename(ent_old = entidad) %>% 
+  dplyr::left_join(correct.loc, by =c("NOM_LOC","NOM_ENT")) %>% 
+  mutate(NOM_LOC = dplyr::if_else(!is.na(NOM_LOC_REV), NOM_LOC_REV, NOM_LOC)) %>%
+  dplyr::rename(mun_old = municipio, loc_old = localidad) %>% 
+  select(NOM_LOC, NOM_ENT, beneficiario, monto_conapesca) %>% 
+  keep_when(monto_conapesca>0)
+
+#some states, municipalites and locations are wrong so starting from ENT
+gas.subsidy.ent <- gas.subsidy.comms %>% 
+  dplyr::left_join(cost.codes.ent, by=c("NOM_ENT")) %>% 
+  select(CVE_ENT, dplyr::everything())
+
+gas.subsidy.loc <- gas.subsidy.ent %>% 
+   dplyr::left_join(inegi.cost.comm, by=c("CVE_ENT","NOM_LOC","NOM_ENT")) %>% 
+  select(CVE_LOC, CVE_MUN, CVE_ENT, dplyr::everything())
+
+gas.subsidy.codes <- gas.subsidy.loc %>% 
+  keep_when(!is.na(CVE_LOC)) %>% 
+  mutate(id_row = 1) %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_bengas=sum(id_row), tot_bengas=sum(monto_conapesca)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(bengas_perc = (tot_bengas / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_bengas, bengas_perc)
+
+
+#BIENPESCA
+
+bienpesca.files <- c(here::here("inputs","fishery_subsidies","beneficiarios_PROPESCA_BIENPESCA_2014-2018.xlsx"),
+                     here::here("inputs","fishery_subsidies","padron_BIENPESCA_2019.xlsx"),
+                     here::here("inputs","fishery_subsidies","bien_pescadores_y_acuicultores_2020.xlsx"),
+                     here::here("inputs","fishery_subsidies","/bienpesca_2021.xlsx"),
+                     here::here("inputs","fishery_subsidies","bienpesca_2022.xlsx"),
+                     here::here("inputs","fishery_subsidies","fishery_subsidies/bienpesca_2023.xlsx"))
+
+bpesca.subsidy.comms <- lapply(bienpesca.files, clean_bienpesca, inegi.cost.comm) %>% 
+  dplyr::bind_rows()
+
+bpesca.subsidy.codes <- bpesca.subsidy.comms %>% 
+  extract_comms(inegi.cost.comm) %>% 
+  select(-NOM_MUN, -CVE_MUN, -cve_mun) %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("NOM_ENT","CVE_ENT","NOM_LOC","CVE_LOC","POBTOT")) %>%  
+  make_code()
+ 
+bpesca.subsidy.res <- bpesca.subsidy.codes %>% 
+  mutate(id_row = 1) %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_bpesca=sum(id_row), tot_bpesca=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(bpesca_perc = (tot_bpesca / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_bpesca, bpesca_perc)
+
+
+#vessel modernization
+
+boat.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_modernizacion_barcos_2011-2019.xlsx"))
+
+boat.subsidy.comms <- extract_comms(boat.subsidy, inegi.cost.comm)
+
+boat.subsidy.table <- boat.subsidy.comms %>% 
+  keep_when(año>=2014) %>% 
+  keep_when(tipo_cobertura=="LOCAL") %>% 
+  select(-cve_loc) %>% 
+  mutate(id_row = 1, monto_gob_edo = as.numeric(monto_gob_edo), monto_productor = as.numeric(monto_productor), mont_tot = (monto_productor + monto_gob_edo + monto_conapesca) )%>% 
+  keep_when(mont_tot!=0) %>% 
+  select(-NOM_MUN) %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("NOM_ENT","NOM_LOC")) %>%  
+  make_code() 
+
+boat.subsidy.codes <- boat.subsidy.table %>%
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_boat=sum(id_row), tot_boat=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(boat_perc = (tot_boat / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_boat, boat_perc)
+
+#subsidies for product commercialization
+commerce.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_comercializacion_2014-2019.xlsx"))
+
+commerce.subsidy.comms <- extract_comms(commerce.subsidy, inegi.cost.comm)
+
+commerce.subsidy.table <- commerce.subsidy.comms %>% 
+  keep_when(tipo_cobertura=="LOCAL") %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(mont_tot = (monto_gob_edo + monto_conapesca))%>% 
+  keep_when(mont_tot!=0) %>% 
+   make_code() 
+  
+commerce.subsidy.codes <- commerce.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_comm=sum(no_beneficiarios), tot_comm=sum(mont_tot)) %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(comm_perc = (tot_comm / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_comm, comm_perc)
+
+
+#subsidies to support seafood consumption
+consump.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_consumo_2014-2019.xlsx"))
+
+consump.subsidy.comms <- extract_comms(consump.subsidy, inegi.cost.comm)
+
+consump.subsidy.table <- consump.subsidy.comms %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  make_code()
+
+consump.subsidy.codes <- consump.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_cons=sum(id_row), tot_cons=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(cons_perc = (tot_cons / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_cons, cons_perc)
+
+#subsidies to strengthen fisheries
+str.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_fortalecimiento_2011-2019.xlsx")) %>% 
+  keep_when(año>=2014)
+
+str.subsidy.comms <- extract_comms(str.subsidy, inegi.cost.comm)
+
+str.subsidy.table <- str.subsidy.comms %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+str.subsidy.codes <- str.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_str=sum(id_row), tot_str=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(str_perc = (tot_str / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_str, str_perc)
+
+#subsidies to support fishery value chains
+value.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_cadenas_productivas_2011-2019.xlsx")) %>% 
+  keep_when(año>=2014)
+
+value.subsidy.comms <- extract_comms(value.subsidy, inegi.cost.comm)
+
+value.subsidy.table <- value.subsidy.comms %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+value.subsidy.codes <- value.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_value=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(value_perc = (tot_value / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_value, value_perc)
+
+
+#subsidies to strengthen fisheries
+str.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_fortalecimiento_2011-2019.xlsx")) %>% 
+  keep_when(año>=2014)
+
+str.subsidy.comms <- extract_comms(str.subsidy, inegi.cost.comm)
+
+str.subsidy.table <- str.subsidy.comms %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+str.subsidy.codes <- str.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_str=sum(id_row), tot_str=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(str_perc = (tot_str / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_str, str_perc)
+
+#subsidies to strengthen inspection and surveillance
+ins.subsidy <- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_vigilancia_2011-2019.xlsx")) %>% 
+  keep_when(año>=2014) %>% 
+  dplyr::rename(localidad = localidad_ue, municipio = municipio_ue)
+
+ins.subsidy.comms <- extract_comms(ins.subsidy, inegi.cost.comm)
+
+ins.subsidy.table <- ins.subsidy.comms %>% 
+  dplyr::rename(CVE_MUN = cve_mun_ue, CVE_ENT=cve_ent_ue) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+ins.subsidy.codes <- ins.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_ins=sum(id_row), tot_ins=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(ins_perc = (tot_ins / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_ins, ins_perc)
+
+
+#subsidies to strengthen the legal framework
+leg.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_ordenamiento_2011-2019.xlsx")) %>% 
+  keep_when(año>=2014) 
+
+leg.subsidy.comms <- extract_comms(leg.subsidy, inegi.cost.comm)
+
+leg.subsidy.table <- leg.subsidy.comms %>% 
+  dplyr::rename( CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  dplyr::left_join(correct.loc, by =c("NOM_LOC","NOM_ENT")) %>% 
+  mutate(NOM_LOC = dplyr::if_else(!is.na(NOM_LOC_REV), NOM_LOC_REV, NOM_LOC)) %>%
+  make_code()
+
+leg.subsidy.codes <- leg.subsidy.table %>% 
+  keep_when(!is.na(CVE_LOC)) %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_leg=sum(id_row), tot_leg=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(leg_perc = (tot_leg / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_leg, leg_perc)
+
+
+#subsidies to reduce effort in industrial fishing
+eff.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_reduccion_esfuerzo_2011-2018.xlsx")) %>% 
+  keep_when(año>=2014)
+
+eff.subsidy.comms <- extract_comms(eff.subsidy, inegi.cost.comm)
+
+eff.subsidy.table <- eff.subsidy.comms %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code()
+
+eff.subsidy.codes <- eff.subsidy.table %>% 
+  group_by(CVE_LOC, CVE_MUN) %>% 
+  summarise(no_eff=sum(id_row), tot_eff=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  mutate(eff_perc = (tot_eff / POBTOT)) %>% 
+  select(CVE_LOC, CVE_MUN, no_eff, eff_perc)
+
+
+all.fishery.subsidies <- inegi.cost.comm %>% 
+  select(CVE_LOC, CVE_MUN) %>% 
+  dplyr::left_join(bpesca.subsidy.res, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(seed.subsidy.res, by = c("CVE_LOC", "CVE_MUN")) %>%
+  dplyr::left_join(gas.subsidy.codes,by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(boat.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(commerce.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(aqua.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(consump.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(value.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(str.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(ins.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(leg.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(eff.subsidy.codes, by = c("CVE_LOC", "CVE_MUN")) %>% 
+  dplyr::left_join(gen.subsidy.res, by = c("CVE_LOC", "CVE_MUN"))
+
+fishery.tot.subs <- all.fishery.subsidies %>% 
+  replace(is.na(.), 0) 
+
+fishery.comm.subs <- fishery.tot.subs %>%
+  mutate(sum = rowSums(dplyr::across(no_bpesca:gen_perc), na.rm=TRUE)) %>% 
+  keep_when(sum>0)
+
+#fishery.tot.subs %>% summarise(across(no_bpesca:gen_perc, sum)) #use to test that all columns have value
+
+fishery.tot.subs %>% distinct(CVE_LOC)
+
+readr::write_csv(fishery.tot.subs, paste0(input.dir,"/processed_data/adaptive_capacity/","fisheries_subsidies.csv"))
+
+```
+
+
+
+
 ```{r cars}
 
 
