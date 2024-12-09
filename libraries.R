@@ -18,3 +18,4 @@ remotes::install_github("iobis/robis")
 
 # Load packages into session 
 lapply(.packages, require, character.only=TRUE)
+

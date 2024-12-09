@@ -13,6 +13,8 @@ Vulnerabilidad de areas cercanas a oficinas de pesca
 source("libraries.R")
 source("huachinango_functions.R")
 
+import::from(dplyr, mutate, distinct, select, group_by, summarise, keep_when = filter)
+
 
 ```
 
@@ -337,6 +339,148 @@ readr::write_csv(fishery.tot.subs, paste0(input.dir,"/processed_data/adaptive_ca
 
 
 
+```{r catch, echo=TRUE}
+
+catch.sv <- data.table::fread(here::here("inputs","catch","DB_AA_Menores_00_23.csv")) 
+
+catch.sv.tm <-catch.sv %>% 
+  dplyr::filter(`YEAR CORTE`>=2011)
+
+sp.names <- unique(catch.sv.tm$`NOMBRE PRINCIPAL`)
+
+sp.names <- catch.sv.tm %>% 
+  dplyr::select(`NOMBRE ESPECIE`) %>% 
+  dplyr::arrange()
+
+huachinango.catch <- catch.sv.tm %>% 
+  dplyr::filter(grepl(("GUACH|HUACH|LUTJANUS"), `NOMBRE ESPECIE`)) %>% 
+  dplyr::filter(`NOMBRE PRINCIPAL`!="RUBIO")
+
+huach.names <- unique(huachinango.catch$`NOMBRE PRINCIPAL`)
+huach.names.sp <- unique(huachinango.catch$`NOMBRE ESPECIE`)
+
+#Get unique RNPA
+
+
+rnpa.names <- length(unique(huachinango.catch$`RNPA UNIDAD ECONOMICA`))
+
+
+locs.pesca <- clean_locs_pesca()
+
+get_catch(catch.file=huachinango.catch, locs.pesca)
+
+```
+
+
+
+
+
+
+Extract permit information from the Registro Nacional de Pesca y Acuacultura RNPA 
+https://www.gob.mx/conapesca/documentos/registro-nacional-de-pesca-y-acuacultura-rnpa
+
+```{r get catch, echo=TRUE, message=TRUE, warning=TRUE}
+
+#googlesheet to keep track of names that need correction
+googlesheets4::gs4_deauth()
+locs.pesca <- googlesheets4::read_sheet("1eJXjwlHqEzSAZaTmE_XyN93fu6EI0I8igRH4AdvXOl8")
+
+
+input.dir <- "~/coastalvulnerability-inputs"
+
+ents.coast.selecc <- toupper(c("Baja California Sur", "Baja California", "Sonora", "Sinaloa", "Nayarit", "Jalisco", "Yucatán", "Campeche", "Quintana Roo"))
+coast.selecc <- stringi::stri_trans_general(str = ents.coast.selecc, id = "Latin-ASCII")
+
+#only communities considered in the analysis
+inegi.cost.comm  <- readr::read_csv(paste0(input.dir,"/processed_data/","inegi_coast_comm.csv")) %>% 
+  mutate(NOM_ENT= stringi::stri_trans_general(str = NOM_ENT, id = "Latin-ASCII"), NOM_ENT = toupper(NOM_ENT)) %>% 
+  mutate(NOM_MUN = stringi::stri_trans_general(str = NOM_MUN, id = "Latin-ASCII"), NOM_MUN = toupper(NOM_MUN)) %>% 
+  mutate(NOM_LOC = stringi::stri_trans_general(str = NOM_LOC, id = "Latin-ASCII"), NOM_LOC = toupper(NOM_LOC))
+
+inegi.cost.mun <- inegi.cost.comm %>% 
+  distinct(NOM_MUN, CVE_MUN)
+
+permit.files <- list.files(path = paste0(input.dir,"/sensitivity/permit_data"), full.names = TRUE)
+no.permitfiles <- 1:length(permit.files)
+
+permit.data.inegi <- lapply(no.permitfiles, extract_permits, permit.files, inegi.cost.comm, locs.pesca)
+
+# to check location names
+# permit.table <- permit.data.inegi %>% 
+#   dplyr::bind_rows() %>% 
+#   keep_when(!is.na(NOM_LOC)) %>% 
+#   keep_when(is.na(CVE_MUN)) %>% distinct(NOM_ENT, NOM_MUN, NOM_LOC, CVE_MUN, CVE_LOC)
+ 
+permit.table <- permit.data.inegi %>% 
+  dplyr::bind_rows() %>% 
+  keep_when(!is.na(CVE_LOC)) %>% 
+  distinct(NOM_ENT, rnp_code, NOM_MUN, NOM_LOC, CVE_MUN, CVE_LOC,  deci_lat, deci_lon, POBTOT) %>% 
+  select(-NOM_MUN) %>% 
+  dplyr::left_join(inegi.cost.mun, by = "CVE_MUN")
+
+permit.per.loc <- permit.table %>% 
+  mutate(index_no = 1) %>% 
+  group_by(NOM_ENT, NOM_MUN, NOM_LOC, CVE_MUN, CVE_LOC, deci_lat, deci_lon, POBTOT) %>% 
+  summarise(tot_perm=sum(index_no)) %>% 
+  mutate(perm_pcapita = tot_perm/POBTOT) %>% 
+  select(CVE_MUN, CVE_LOC, tot_perm, perm_pcapita)
+
+readr::write_csv(permit.per.loc, paste0(input.dir,"/processed_data/sensitivity/fishery_permits.csv"))
+
+#match to rnpa number
+
+catch.rnpa <-  huachinango.catch %>%
+    dplyr::group_by(`RNPA UNIDAD ECONOMICA`,`NOMBRE PRINCIPAL`,`NOMBRE ESPECIE`,`YEAR CORTE`) %>%
+    dplyr::mutate(value_pesos=(PRECIO_PESOS * `PESO DESEMBARCADO_KILOGRAMOS`)) %>% 
+    dplyr::summarise(tot_weight_kg=sum(`PESO DESEMBARCADO_KILOGRAMOS`), tot_value_pesos=sum(value_pesos)) %>%
+    dplyr::ungroup() %>%
+    dplyr::rename(rnp_code=`RNPA UNIDAD ECONOMICA`, catch_name = `NOMBRE PRINCIPAL`, sp_name = `NOMBRE ESPECIE`, year = `YEAR CORTE`)
+
+rnpa.catch.table <- catch.rnpa %>%
+  dplyr::bind_rows() %>% 
+  mutate(rnp_code = as.character(rnp_code))
+
+catch.rnpa.codes <- rnpa.catch.table %>%
+  distinct(rnp_code) 
+
+catch.permit.table <- catch.rnpa.codes %>% 
+  dplyr::left_join(permit.table, by = c("rnp_code"))
+
+catch.loc <- catch.permit.table %>% 
+  dplyr::left_join(rnpa.catch.table, by = c("rnp_code")) 
+
+found.rnpa <- catch.loc %>% 
+  dplyr::filter(!is.na(NOM_ENT)) %>% 
+  dplyr::distinct(rnp_code)
+
+missing.rnpa <- catch.loc %>% 
+  dplyr::filter(is.na(NOM_ENT)) %>% 
+  dplyr::distinct(rnp_code)
+
+#from coastalvulnerability repository
+catch.locs.all <- readr::read_csv(paste0(input.dir,"/processed_data/localidades_captura_inegi.csv"))
+
+locationmatch
+
+%>% 
+  select(-NOM_MUN) %>% 
+  dplyr::left_join(inegi.cost.mun, by = "CVE_MUN") %>% 
+  group_by(CVE_MUN, CVE_LOC, POBTOT) %>% 
+  summarise(tot_catch_mt = sum(tot_weight_kg)/ 1000) %>% 
+  mutate(catch_percapita = tot_catch_mt/ POBTOT) 
+
+```
+
+
+```{r}
+
+
+
+```
+
+
+
+
 
 ```{r cars}
 
@@ -348,7 +492,7 @@ num.beneficios <- 1:length(beneficios.csv)
 tipo.beneficio <- c("cadenas productivas", "combustible", "comercializacion productos pesqueros", "consumo productos pesqueros","fortalecimiento de capacidades.csv", "inspeccion y vigilancia", "modernizacion de embarcaciones", "obras y estudios", "ordenamiento pesquero","Bienpesca","reduccion del esfuerzo pesquero",         
 "Bienpesca")
 
-names.sp <-c("guachinango","guachinangos","huachinangos","huachinango")
+names.sp <-toupper(c("guachinango","guachinangos","huachinangos","huachinango"))
   
 beneficios.data <- lapply(num.beneficios, clean_files, beneficios.csv, tipo.beneficio)
 

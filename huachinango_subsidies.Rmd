@@ -1,0 +1,531 @@
+---
+title: "Huachinango_subsidies"
+output: html_document
+date: "2024-12-07"
+---
+
+
+```{r setup, include=FALSE}
+
+source("libraries.R")
+source("huachinango_functions.R")
+
+import::from(dplyr, mutate, distinct, select, group_by, summarise, keep_when = filter)
+
+```
+
+
+Gets list of fishery offices from catch records
+Uses standarized catch data to get unique fishery offices and georeference them
+```{r Get fishery offices}
+
+locs.pesca <- clean_locs_pesca()
+
+#get unique georeferenced rnp codes
+
+#run to get inegi data
+inegigc <- get_inegi()
+
+catchdata <- data.table::fread(here::here("inputs","catch","DB_AA_Menores_00_23.csv")) 
+
+catch.sv.tm <-catchdata %>% 
+  dplyr::filter(`YEAR CORTE`>=2021)
+
+sp.names <- unique(catch.sv.tm$`NOMBRE PRINCIPAL`)
+
+sp.names <- catch.sv.tm %>% 
+  dplyr::select(`NOMBRE ESPECIE`) %>% 
+  dplyr::arrange()
+
+huachinango.catch <- catch.sv.tm %>% 
+  dplyr::filter(grepl(("GUACH|HUACH|LUTJANUS"), `NOMBRE ESPECIE`)) %>% 
+  dplyr::filter(`NOMBRE PRINCIPAL`!="RUBIO") %>% 
+   dplyr::rename(rnp_code=`RNPA UNIDAD ECONOMICA`, fishery_office=`NOMBRE OFICINA`, catch_name = `NOMBRE PRINCIPAL`, sp_name = `NOMBRE ESPECIE`, year = `YEAR CORTE`, 
+                  NOM_LOC=`NOMBRE SITIO DESEMBARQUE`, NOM_ENT = `NOMBRE ESTADO`, landed_w_kg= `PESO DESEMBARCADO_KILOGRAMOS`) %>% 
+    dplyr::select(rnp_code, fishery_office,catch_name, sp_name, year, NOM_LOC, NOM_ENT, landed_w_kg)
+
+
+fish.offices.georef <- get_fishery_office_catch(huachinango.catch) 
+
+readr::write_csv(fish.offices.georef, here::here("outputs","fish_offices_rnpa.csv"))
+
+#fishery office list for 2024 is available here https://www.conapesca.gob.mx/work/sites/cona/dgppe/Subdelegaciones_de_Pesca.pdf
+#the La Reforma office is in the Municipality of Angostura and has CVE_LOC = 250020093
+#there are locations named La Reforma sites in Sinaloa so had to be extracted manually
+
+unique.offices <- fish.offices.georef %>% 
+  dplyr::distinct(NOM_LOC, NOM_MUN, NOM_ENT, CVE_ENT, CVE_MUN, CVE_LOC, deci_lon, deci_lat, POBTOT)
+
+fishery.spatial <- sf::st_as_sf(unique.offices, coords = c("deci_lon", "deci_lat"), crs = 4326) %>% 
+  sf::st_transform(6362)#https://epsg.io/6362 Mexico ITRF92 in meters
+
+sf::st_crs(fishery.spatial)
+
+fishery.spatial %>% 
+  sf::st_write(here::here("outputs","fishery_offices.shp"), append=FALSE)
+
+fishery.buffers <- fishery.spatial %>% 
+    sf::st_buffer(10000)
+
+fishery.buffers %>% 
+  sf::st_write(here::here("outputs","fishery_offices_buffer.shp"), append=FALSE)
+
+
+
+```
+
+Fisheries subsidies
+
+```{r fisheries subsidies, echo=TRUE, message=TRUE, warning=FALSE}
+
+input.dir <- "~/coastalvulnerability-inputs"
+
+#run to get inegi data
+inegi.cost.comm <- get_inegi()
+
+cost.codes.ent <- inegi.cost.comm %>%
+  distinct(CVE_ENT, NOM_ENT) 
+
+cost.codes.mun <- inegi.cost.comm %>%
+  distinct(CVE_ENT, NOM_MUN, CVE_MUN) 
+
+cost.codes.loc <- inegi.cost.comm %>%
+   distinct(NOM_ENT, CVE_ENT, NOM_MUN, CVE_MUN, NOM_LOC, CVE_LOC) 
+
+#googlesheet to keep track of names that need correction
+googlesheets4::gs4_deauth()
+locs.pesca <- googlesheets4::read_sheet("1eJXjwlHqEzSAZaTmE_XyN93fu6EI0I8igRH4AdvXOl8")
+
+correct.ent <- locs.pesca %>% 
+  select(-NOM_LOC_REV)
+
+correct.loc <- locs.pesca %>% 
+  select(-NOM_ENT_REV) %>% 
+  keep_when(!is.na(NOM_LOC_REV))
+
+#gas subsidies
+gas.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/padron_beneficiarios_combustible_2011-2019.xlsx")) %>%
+  mutate(localidad=gsub("-"," ",localidad)) %>% 
+  mutate(NOM_ENT = stringi::stri_trans_general(str = entidad, id = "Latin-ASCII")) %>% 
+  mutate(NOM_MUN = stringi::stri_trans_general(str = municipio, id = "Latin-ASCII")) %>% 
+  mutate(NOM_LOC = stringi::stri_trans_general(str = localidad, id = "Latin-ASCII")) %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  keep_when(tipo_cobertura=="LOCALIDAD") %>% 
+  mutate(NOM_LOC = dplyr::if_else(grepl("BAHIA TORTUGAS", unidadeconmica), "BAHIA TORTUGAS", 
+                                  dplyr::if_else(grepl("SCPP EMANCIPACION SC DE RL", unidadeconmica), "BAHIA TORTUGAS", NOM_LOC)))
+
+gas.subsidy.comms <-  gas.subsidy %>% 
+  dplyr::left_join(correct.ent, by =c("NOM_LOC","NOM_ENT")) %>% 
+  mutate(NOM_ENT = dplyr::if_else(!is.na(NOM_ENT_REV), NOM_ENT_REV, NOM_ENT)) %>%
+  dplyr::rename(ent_old = entidad) %>% 
+  dplyr::left_join(correct.loc, by =c("NOM_LOC","NOM_ENT")) %>% 
+  mutate(NOM_LOC = dplyr::if_else(!is.na(NOM_LOC_REV), NOM_LOC_REV, NOM_LOC)) %>%
+  dplyr::rename(mun_old = municipio, loc_old = localidad) %>% 
+  select(NOM_LOC, NOM_ENT, beneficiario, monto_conapesca, rnpa) %>% 
+  keep_when(monto_conapesca>0)
+
+#some states, municipalites and locations are wrong so starting from ENT
+gas.subsidy.ent <- gas.subsidy.comms %>% 
+  dplyr::left_join(cost.codes.ent, by=c("NOM_ENT")) %>% 
+  select(CVE_ENT, dplyr::everything())
+
+gas.subsidy.loc <- gas.subsidy.ent %>% 
+  dplyr::left_join(inegi.cost.comm, by=c("CVE_ENT","NOM_LOC","NOM_ENT")) %>% 
+  select(CVE_LOC, CVE_MUN, CVE_ENT, dplyr::everything())
+
+gas.subsidy.codes <- gas.subsidy.loc %>% 
+  keep_when(!is.na(CVE_LOC)) %>% 
+  mutate(id_row = 1) %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(monto_conapesca)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="gas") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+
+#BIENPESCA
+
+bienpesca.files <- c(here::here("inputs","fishery_subsidies","beneficiarios_PROPESCA_BIENPESCA_2014-2018.xlsx"),
+                     here::here("inputs","fishery_subsidies","padron_BIENPESCA_2019.xlsx"),
+                     here::here("inputs","fishery_subsidies","bien_pescadores_y_acuicultores_2020.xlsx"),
+                     here::here("inputs","fishery_subsidies","bienpesca_2021.xlsx"),
+                     here::here("inputs","fishery_subsidies","bienpesca_2022.xlsx"),
+                     here::here("inputs","fishery_subsidies","bienpesca_2023.xlsx"))
+
+bpesca.subsidy.comms <- lapply(bienpesca.files, clean_bienpesca, inegi.cost.comm, locs.pesca) %>% 
+  dplyr::bind_rows()
+
+bpesca.subsidy.codes <- bpesca.subsidy.comms %>% 
+  mutate(id_row = 1) %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(NOM_LOC, NOM_MUN, NOM_ENT, rnpa, year) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(subsidy="bienpesca") %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("NOM_ENT","NOM_MUN","NOM_LOC")) %>% 
+  dplyr::select(NOM_ENT, NOM_MUN, NOM_LOC, CVE_ENT, CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa, year)
+
+
+#vessel modernization
+
+boat.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_modernizacion_barcos_2011-2019.xlsx"))
+
+boat.subsidy.table <- boat.subsidy %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  make_code() %>% 
+  keep_when(tipo_cobertura=="LOCAL") %>% 
+  #  select(-cve_loc) %>% 
+  mutate(id_row = 1, monto_gob_edo = as.numeric(monto_gob_edo), monto_productor = as.numeric(monto_productor), mont_tot = (monto_productor + monto_gob_edo + monto_conapesca) )%>% 
+  keep_when(mont_tot!=0)  
+
+boat.subsidy.codes <- boat.subsidy.table %>%
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="vessel modernization") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+#subsidies for product commercialization
+commerce.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_comercializacion_2014-2019.xlsx"))
+
+commerce.subsidy.table <- commerce.subsidy %>% 
+  keep_when(tipo_cobertura=="LOCAL") %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(mont_tot = (monto_gob_edo + monto_conapesca))%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+commerce.subsidy.codes <- commerce.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(no_beneficiarios), tot_value=sum(mont_tot)) %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="commercialization") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+
+#subsidies to support seafood consumption
+consump.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_consumo_2014-2019.xlsx"))
+
+consump.subsidy.table <- consump.subsidy %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  make_code()
+
+consump.subsidy.codes <- consump.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="seafood consumption") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+#subsidies to strengthen fisheries
+str.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_fortalecimiento_2011-2019.xlsx")) 
+
+str.subsidy.table <- str.subsidy %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+str.subsidy.codes <- str.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="strengthening fisheries") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+#subsidies to support fishery value chains
+value.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_cadenas_productivas_2011-2019.xlsx")) 
+
+value.subsidy.table <- value.subsidy %>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+value.subsidy.codes <- value.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="value chains") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+#subsidies to strengthen inspection and surveillance
+ins.subsidy <- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_vigilancia_2011-2019.xlsx")) %>% 
+  dplyr::rename(localidad = localidad_ue, municipio = municipio_ue)
+
+ins.subsidy.table <- ins.subsidy %>% 
+  dplyr::rename(CVE_MUN = cve_mun_ue, CVE_ENT=cve_ent_ue, CVE_LOC =cve_inegi) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code() 
+
+ins.subsidy.codes <- ins.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="surveillance") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+
+#subsidies to strengthen the legal framework
+leg.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_ordenamiento_2011-2019.xlsx")) 
+
+leg.subsidy.table <- leg.subsidy %>% 
+  dplyr::rename(CVE_LOC = cve_inegi, CVE_MUN=cve_mun, CVE_ENT=cve_ent) %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  keep_when(localidad!="NA") %>% 
+  make_code()
+
+leg.subsidy.codes <- leg.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  keep_when(!stringr::str_detect(CVE_LOC, "NA")) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="management") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+
+#subsidies to reduce effort in industrial fishing
+eff.subsidy<- readxl::read_xlsx(paste0(input.dir,"/adaptive_capacity/fishery_subsidies/beneficiarios_reduccion_esfuerzo_2011-2018.xlsx")) 
+
+eff.subsidy.table <- eff.subsidy %>% 
+  mutate(id_row = 1, mont_tot = monto_conapesca)%>% 
+  dplyr::rename(CVE_LOC=cve_loc, CVE_MUN = cve_mun, CVE_ENT=cve_ent) %>% 
+  keep_when(mont_tot!=0) %>% 
+  make_code()
+
+eff.subsidy.codes <- eff.subsidy.table %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  group_by(CVE_LOC, CVE_MUN, rnpa) %>% 
+  summarise(no_sub=sum(id_row), tot_value=sum(mont_tot)) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::left_join(inegi.cost.comm, by = c("CVE_LOC","CVE_MUN")) %>% 
+  dplyr::mutate(subsidy="effort reduction") %>% 
+  select(CVE_LOC, CVE_MUN, tot_value, no_sub, subsidy, rnpa)
+
+#save bienpesca differently because not all records have correct CVEs
+
+bpesca.subsidy.codes.rnp <- bpesca.subsidy.codes %>% 
+  dplyr::filter(rnpa!="BIENPESCA") %>% 
+  dplyr::filter(rnpa!="NA")
+
+readr::write_csv(bpesca.subsidy.codes.rnp, here::here("bpesca_subsidy_rnp.csv"))
+
+bpesca.subsidy.codes.bp <- bpesca.subsidy.codes %>% 
+  dplyr::filter(year>="2020") 
+
+readr::write_csv(bpesca.subsidy.codes.bp, here::here("bpesca_subsidy_2020-2023.csv"))
+
+all.fishery.subsidies <-
+  dplyr::bind_rows(boat.subsidy.codes, commerce.subsidy.codes, consump.subsidy.codes, eff.subsidy.codes, gas.subsidy.codes, ins.subsidy.codes, leg.subsidy.codes, str.subsidy.codes, value.subsidy.codes) %>% 
+  left_join(inegi.cost.comm, by = c("CVE_LOC", "CVE_MUN"))
+
+readr::write_csv(all.fishery.subsidies, here::here("outputs","fisheries_subsidies.csv"))
+
+fishery.comm.subs <- all.fishery.subsidies %>%
+  dplyr::filter(!is.na(NOM_ENT)) %>% #there are 14 records where location was NA or are not coastal states
+  dplyr::group_by(CVE_LOC, CVE_MUN, CVE_ENT, NOM_LOC, NOM_MUN, NOM_ENT, rnpa) %>% 
+  dplyr::summarise(tot_subsidies = sum(tot_value)) %>% 
+  left_join(inegi.cost.comm, by = c("NOM_ENT","NOM_MUN","NOM_LOC","CVE_ENT","CVE_MUN","CVE_LOC"))
+
+#fishery.tot.subs %>% summarise(across(no_bpesca:gen_perc, sum)) #use to test that all columns have value
+
+readr::write_csv(fishery.comm.subs, here::here("outputs","tot_fisheries_subsidies.csv"))
+
+
+
+```
+
+Get RNPA of economic units that extract Lutjanus in the Pacific, subsidy files are for the Gulf of Mexico and the Pacific
+
+```{r}
+
+coastal.states <- toupper(c("Baja California","Baja California Sur","Sonora",
+"Sinaloa", "Nayarit", "Jalisco", "Colima", "Michoacan de Ocampo","Guerrero","Oaxaca","Chiapas"))
+
+
+fish.offices.georef <- readr::read_csv(here::here("outputs","fish_offices_rnpa.csv")) %>% 
+  dplyr::filter(NOM_ENT %in% coastal.states) %>% 
+  dplyr::rename(rnpa=rnp_code) %>% 
+  dplyr::mutate(rnpa = as.character(rnpa))
+
+fish.offices.georef %>% distinct(rnpa)
+
+rnpa.huachinango.codes <- fish.offices.georef %>% 
+  dplyr::distinct(rnpa) %>% 
+  dplyr::pull(rnpa)
+
+huach.comm.subs <- readr::read_csv(here::here("outputs","tot_fisheries_subsidies.csv")) %>% 
+   dplyr::filter(NOM_ENT %in% coastal.states) %>% 
+  dplyr::mutate(rnpa = as.character(rnpa)) %>% 
+  dplyr::filter(!is.na(rnpa)) %>% 
+  dplyr::filter(rnpa %in% rnpa.huachinango.codes) %>% 
+  dplyr::group_by(rnpa) %>% 
+  dplyr::summarise(sum_subsidies=sum(tot_subsidies)) %>% 
+  dplyr::select(rnpa, sum_subsidies)
+
+
+all.fishery.subsidies <- readr::read_csv(here::here("outputs","fisheries_subsidies.csv")) %>% 
+   dplyr::filter(NOM_ENT %in% coastal.states)
+
+
+huachinango.rnpa.subs.types <- all.fishery.subsidies %>% 
+  dplyr::filter(rnpa %in% rnpa.huachinango.codes) 
+ 
+  huachinango.rnpa.subs.types %>%  distinct(subsidy)
+  
+  sum(huachinango.rnpa.subs.types$tot_value)/20.20
+
+  #get subsidy value in dollars
+  round(sum(huachinango.rnpa.subs.types$tot_value)/20.20,-5)
+
+  
+  sum(huachinango.rnpa.subs.types$tot_value)
+  
+
+#estimate benefit by bienpesca
+
+bpesca.subsidy.codes.rnp <- readr::read_csv(here::here("bpesca_subsidy_rnp.csv")) %>% 
+   dplyr::filter(NOM_ENT %in% coastal.states)
+
+bienpesca.sub <- bpesca.subsidy.codes.rnp %>% 
+  dplyr::mutate(rnpa=as.character(rnpa)) %>% 
+  dplyr::filter(rnpa%in% rnpa.huachinango.codes) 
+
+bienpesca.sub %>% dplyr::distinct(rnpa)
+
+sum(bienpesca.sub$tot_value)
+
+ #get subsidy value in dollars
+  round(sum(bienpesca.sub$tot_value),-5)
+
+  #get subsidy value in dollars
+  round(sum(bienpesca.sub$tot_value)/20.20,-5)
+
+
+bpesca.subsidy.codes.bp <- readr::read_csv(here::here("bpesca_subsidy_2020-2023.csv")) %>% 
+     dplyr::filter(NOM_ENT %in% coastal.states)
+
+sum(bpesca.subsidy.codes.bp$tot_value)
+
+ #get subsidy value in dollars
+  round(sum(bpesca.subsidy.codes.bp$tot_value),-5)
+
+  #get subsidy value in dollars
+  round(sum(bpesca.subsidy.codes.bp$tot_value)/20.20,-5)
+
+#estimate average bienpesca grants per year
+bpesca.av.yr<-   bpesca.subsidy.codes.bp %>% 
+    dplyr::group_by(year) %>% 
+    dplyr::summarise(tot_no_sub=sum(no_sub))
+
+mean(bpesca.av.yr$tot_no_sub)
+    
+tot.part <- bpesca.subsidy.codes.bp %>% dplyr::group_by(year) %>% summarise(tot_rec=sum(no_sub))
+mean(tot.part$tot_rec)
+sum(tot.part$tot_rec)*7200
+
+#get total number of economic units that receive subsidies
+
+rnpa.bp <- bienpesca.sub %>% distinct(rnpa)
+rnpa.subs <- huach.comm.subs %>% distinct(rnpa)
+
+rnpa.bp %>% bind_rows(rnpa.subs) %>% distinct(rnpa)
+
+rnpa.bp %>% dplyr::full_join(rnpa.subs, by="rnpa")  %>% 
+  dplyr::filter(!rnpa %in% rnpa.subs$rnpa)
+
+#estimate subsidies by state
+
+fishery.ent.huach <- readr::read_csv(here::here("outputs","tot_fisheries_subsidies.csv")) %>% 
+  dplyr::filter(NOM_ENT %in% coastal.states) %>% 
+  dplyr::filter(!is.na(rnpa)) %>% 
+  dplyr::filter(rnpa %in% rnpa.huachinango.codes) %>% 
+  dplyr::group_by(NOM_ENT) %>% 
+  dplyr::summarise(sum_subsidies=sum(tot_subsidies)) %>% 
+  dplyr::arrange(sum_subsidies)
+  
+sum(fishery.ent.huach$sum_subsidies)
+
+
+#assign subsidies to fishery offices and make map
+
+office.subs.codes <- huach.comm.subs %>% dplyr::left_join(fish.offices.georef, by ="rnpa")
+
+
+subs.spatial <- office.subs.codes %>% 
+  group_by(NOM_LOC,NOM_ENT, NOM_MUN, CVE_LOC, CVE_MUN, CVE_ENT, deci_lon, deci_lat) %>% 
+  dplyr::summarise(tot_subsidies=sum(sum_subsidies)) %>% 
+  sf::st_as_sf(coords = c("deci_lon", "deci_lat"), crs = 4326) %>% 
+  sf::st_transform(6362)#https://epsg.io/6362 Mexico ITRF92 in meters
+
+sf::st_crs(subs.spatial)
+
+#this was not working due to a too wide number
+subs.spatial %>% 
+  sf::st_write(here::here("outputs","subsidies_fishery_offices.shp"), append=FALSE)
+
+subs.coords <- subs.spatial %>% 
+  sf::st_coordinates()
+
+subs.coord.table <- subs.spatial %>% 
+  sf::st_drop_geometry() %>% 
+  dplyr::ungroup() %>% 
+    dplyr::bind_cols(subs.coords)
+
+#make map, moved final map to ArcGIS because there were limited options for scale bar and arrow formattign and tmap will not install
+readr::write_csv(subs.coord.table, here::here("outputs","subsidies_fishery_offices.csv"))
+  
+#coastal.states <- c("Tamaulipas","Veracruz de Ignacio de la Llave","Tabasco", "Campeche","Yucatán","Quintana Roo","Baja California","Baja California Sur","Sonora",
+#"Sinaloa", "Nayarit", "Jalisco", "Colima", "Michoacán de Ocampo","Guerrero","Oaxaca","Chiapas")
+
+coastal.states <- c("Baja California","Baja California Sur","Sonora",
+"Sinaloa", "Nayarit", "Jalisco", "Colima", "Michoacán de Ocampo","Guerrero","Oaxaca","Chiapas")
+
+coast.state.mx <- sf::st_read(here::here("inputs","ESTADOS.shp")) %>% 
+                       sf::st_transform(6362) %>% 
+  dplyr::filter(NOM_ENT %in% coastal.states)
+
+coast_points <- sf::st_centroid(coast.state.mx)
+coast_points.cor <- cbind(coast.state.mx, st_coordinates(sf::st_centroid(coast.state.mx$geometry)))
+
+
+subs.spatial %>% dplyr::ungroup() %>% distinct(NOM_ENT)
+
+subs.map <- ggplot2::ggplot(data = coast.state.mx) +
+  ggplot2::geom_sf() +
+  ggplot2::geom_text(data= coast_points.cor,ggplot2::aes(x=X, y=Y, label=NOM_ENT), color = "black", check_overlap = TRUE, size = 2) +
+  ggplot2::xlab("Longitude") + ggplot2::ylab("Latitude") +
+  ggspatial::annotation_scale(location = "bl", width_hint = 0.5) +
+  ggspatial::annotation_north_arrow(location = "tl", which_north = "true", 
+                                    pad_x = unit(0.75, "in"), pad_y = unit(0.5, "in"),
+                                    style = north_arrow_minimal) +
+  ggplot2::theme_light() + 
+  ggplot2::geom_sf(data = subs.spatial, mapping = ggplot2::aes(color = tot_subsidies))+
+  coord_sf(crs = sf::st_crs(coast.state.mx), datum = NA)+
+  ggplot2::theme(
+    panel.ontop = TRUE,   ## Note: this is to make the panel grid visible in this example
+    panel.grid = element_blank(), 
+    # rect = element_blank(), 
+    text = ggplot2::element_blank(), 
+    plot.background = element_rect(fill = "white"))
+
+```
+
